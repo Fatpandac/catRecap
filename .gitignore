@@ -1,0 +1,32 @@
+# Python / build
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Credentials
+.env
+.env.*
+!.env.example
+
+# Private footage, generated clips, and model weights
+/data/
+/models/
+/runs/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.ts
+*.pt
+*.onnx
+*.log
+
+# OS
+.DS_Store
