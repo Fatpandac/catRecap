@@ -95,7 +95,7 @@ def run(
 
             detect_started = time.monotonic()
             result = _detect(model, frame, config, class_ids, debug)
-            centers = _pet_centers(result, config.detection_confidence)
+            centers = _pet_centers(result, class_ids, config.detection_confidence)
             detect_seconds += time.monotonic() - detect_started
             detections += 1
 
@@ -114,7 +114,7 @@ def run(
 
             event = tracker.update(timestamp, centers)
 
-            if debug and not _show_debug_window(result, tracker, config, timestamp):
+            if debug and not _show_debug_window(result, class_ids, tracker, config, timestamp):
                 break  # 窗口里按了 q
 
             if event == "start":
@@ -228,31 +228,38 @@ def _pet_class_ids(names: dict[int, str], pet_classes: tuple[str, ...]) -> list[
 
 
 def _detect(model, frame, config: Config, class_ids: list[int], debug: bool):
+    # debug 时不限类别、阈值放到很低：否则分不清“模型什么都没看到”和“把猫认成了别的”。
     return model.predict(
         frame,
         imgsz=config.detection_imgsz,
         conf=min(config.detection_confidence, DEBUG_CONFIDENCE) if debug else config.detection_confidence,
-        classes=class_ids,
+        classes=None if debug else class_ids,
         verbose=False,
     )[0]
 
 
-def _pet_centers(result, confidence: float) -> list[tuple[float, float]]:
+def _pet_centers(result, class_ids: list[int], confidence: float) -> list[tuple[float, float]]:
     """返回达到置信度阈值的宠物检测框中心点，归一化到 [0, 1]。"""
     return [
         (float(box[0]), float(box[1]))
-        for box, conf in zip(result.boxes.xywhn.tolist(), result.boxes.conf.tolist())
-        if conf >= confidence
+        for box, conf, cls in zip(
+            result.boxes.xywhn.tolist(), result.boxes.conf.tolist(), result.boxes.cls.tolist()
+        )
+        if conf >= confidence and int(cls) in class_ids
     ]
 
 
-def _show_debug_window(result, tracker: ActivityTracker, config: Config, timestamp: float) -> bool:
+def _show_debug_window(
+    result, class_ids: list[int], tracker: ActivityTracker, config: Config, timestamp: float
+) -> bool:
     """画一帧诊断画面；返回 False 表示用户要退出。"""
-    detected = [
-        f"{result.names[int(cls)]} {conf:.2f}"
-        for cls, conf in zip(result.boxes.cls.tolist(), result.boxes.conf.tolist())
-    ]
-    passed = sum(1 for conf in result.boxes.conf.tolist() if conf >= config.detection_confidence)
+    boxes = list(zip(result.boxes.cls.tolist(), result.boxes.conf.tolist()))
+    detected = [f"{result.names[int(c)]} {v:.2f}" for c, v in boxes if int(c) in class_ids]
+    others = sorted(
+        (f"{result.names[int(c)]} {v:.2f}" for c, v in boxes if int(c) not in class_ids),
+        key=lambda text: -float(text.split()[-1]),
+    )
+    passed = sum(1 for c, v in boxes if int(c) in class_ids and v >= config.detection_confidence)
     cooldown_left = (
         max(0.0, config.notification_cooldown_seconds - (timestamp - tracker.stopped_at))
         if tracker.stopped_at is not None and not tracker.active
@@ -260,7 +267,9 @@ def _show_debug_window(result, tracker: ActivityTracker, config: Config, timesta
     )
     # 每行：文字 + 是否"这一项挡住了触发"（挡住的画红色）
     lines = [
-        (f"detect {len(detected)} [{', '.join(detected[:3]) or 'none'}]", not detected),
+        (f"pet {len(detected)} [{', '.join(detected[:3]) or 'none'}]", not detected),
+        # 非宠物类只是参考：它们能被认出来，说明模型在工作，只是不认得你的猫。
+        (f"other [{', '.join(others[:3]) or 'none'}]", False),
         (f"conf>={config.detection_confidence:.2f} passed {passed}", passed == 0),
         (f"move {tracker.last_move:.4f} / {config.move_threshold:.4f}", tracker.last_move <= config.move_threshold),
         (f"state {'RECORDING' if tracker.active else 'IDLE'}", False),
