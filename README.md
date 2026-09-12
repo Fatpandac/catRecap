@@ -14,6 +14,8 @@ RTSP 视频流 → 每帧解码并进滚动缓冲 → 每隔 DETECTION_INTERVAL 
 - 片段包含事件前 `CLIP_PRE_SECONDS` 秒（滚动缓冲）和停止活动后 `CLIP_POST_SECONDS` 秒；
   `CLIP_MAX_SECONDS` 截断长事件，`NOTIFICATION_COOLDOWN_SECONDS` 防止刷屏。
 - 视频源断线会每 5 秒重连；Telegram 推送失败只记日志，片段留在 `OUTPUT_DIR`。
+- 每 5 分钟打一条心跳日志（处理帧率 / 源帧率 / 单次推理耗时）：处理帧率明显低于源帧率，
+  说明这台机器跟不上实时，需要调大 `DETECTION_INTERVAL`、换 360p 通道或改用 NCNN 模型。
 
 ## 使用
 
@@ -48,6 +50,8 @@ sudo cp deploy/catrecap.service /etc/systemd/system/
 sudo systemctl enable --now catrecap
 journalctl -u catrecap -f
 ```
+
+摄像头一般有多路码流（1080p/720p/360p），Pi 5 上优先选低分辨率那一路。
 
 Pi 5 是纯 CPU 推理，torch 跑 `yolo11n.pt` 每帧约几十到上百毫秒。默认 `DETECTION_INTERVAL=0.4`、
 `DETECTION_IMGSZ=320` 就是为此留的余量；如果 CPU 吃紧，先调大这两个值，再考虑导出 NCNN：

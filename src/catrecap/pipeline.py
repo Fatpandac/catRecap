@@ -17,6 +17,7 @@ log = logging.getLogger("catrecap")
 
 TELEGRAM_VIDEO_LIMIT = 50 * 1024 * 1024  # Bot API sendVideo 上限
 RECONNECT_DELAY = 5.0
+HEARTBEAT_SECONDS = 300.0  # 心跳日志间隔：树莓派上判断是否跟得上实时
 
 
 def run(config: Config, source: str | None = None, dry_run: bool = False) -> None:
@@ -27,6 +28,8 @@ def run(config: Config, source: str | None = None, dry_run: bool = False) -> Non
     if is_stream:
         # RTSP 默认走 UDP，丢包时画面会碎；树莓派上用 TCP 更稳。
         os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+        # 起播时 FFmpeg 会刷一堆 non-existing PPS / decode_slice_header 噪音，只留 fatal。
+        os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "8")
 
     model = YOLO(config.yolo_model)
     class_ids = _pet_class_ids(model.names, config.pet_classes)
@@ -43,6 +46,7 @@ def run(config: Config, source: str | None = None, dry_run: bool = False) -> Non
     clip_path = None
     frame_index = 0
     last_detection_at = -1e9
+    heartbeat_at, heartbeat_frames, detections, detect_seconds = time.monotonic(), 0, 0, 0.0
 
     try:
         while True:
@@ -69,6 +73,7 @@ def run(config: Config, source: str | None = None, dry_run: bool = False) -> Non
                 continue
 
             frame_index += 1
+            heartbeat_frames += 1
             # 实时流用墙钟时间，丢帧不会让时间轴变慢；本地文件按帧号推算。
             timestamp = time.monotonic() if is_stream else frame_index / fps
             buffer.append(frame)
@@ -79,7 +84,24 @@ def run(config: Config, source: str | None = None, dry_run: bool = False) -> Non
                 continue
             last_detection_at = timestamp
 
-            event = tracker.update(timestamp, _pet_centers(model, frame, config, class_ids))
+            detect_started = time.monotonic()
+            centers = _pet_centers(model, frame, config, class_ids)
+            detect_seconds += time.monotonic() - detect_started
+            detections += 1
+
+            now = time.monotonic()
+            if now - heartbeat_at >= HEARTBEAT_SECONDS:
+                elapsed = now - heartbeat_at
+                log.info(
+                    "心跳：处理 %.1f 帧/秒（源 %.1f），推理 %.0fms/次，当前画面宠物 %d 只",
+                    heartbeat_frames / elapsed,
+                    fps,
+                    detect_seconds / max(detections, 1) * 1000,
+                    len(centers),
+                )
+                heartbeat_at, heartbeat_frames, detections, detect_seconds = now, 0, 0, 0.0
+
+            event = tracker.update(timestamp, centers)
             if event == "start":
                 clip_path = config.output_dir / f"pet-{datetime.now():%Y%m%d-%H%M%S}.mp4"
                 writer = _open_writer(clip_path, fps, frame)
