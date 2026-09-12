@@ -84,6 +84,20 @@ debug 模式下检测阈值临时降到 0.1，好让本来被过滤掉的框也�
 
 在树莓派上 ssh 跑 `--debug` 打不开窗口时，会自动降级成只输出上面那行日志。
 
+### 调准确率：先采样再对比，别瞎调参数
+
+```sh
+uv run python tools/probe.py collect --minutes 30   # 蹲守，把疑似有宠物的帧存到 data/samples/
+uv run python tools/probe.py compare                # 对样本跑 模型 x imgsz 的组合
+```
+
+`collect` 用 0.08 的极低阈值采样，宁可多存也不漏难例——**一张都没存下来**本身就是结论：
+模型在这个机位、这个光照下根本不认得你的猫，调阈值没用，得换模型或换角度。
+
+`compare` 输出每个组合的「过阈值帧数 / 平均最高分 / 单帧耗时」，照着最划算的那行改 `.env` 的
+`YOLO_MODEL` 和 `DETECTION_IMGSZ`。经验上 `imgsz` 从 320 提到 640 对小目标提升最大，代价只有
+每帧几十毫秒；还不够再上 `yolo11s.pt`。
+
 首次运行会自动下载 `yolo11n.pt` 到工作目录。
 
 ## 树莓派 5 部署
