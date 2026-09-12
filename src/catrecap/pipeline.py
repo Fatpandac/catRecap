@@ -20,9 +20,13 @@ RECONNECT_DELAY = 5.0
 HEARTBEAT_SECONDS = 300.0  # 心跳日志间隔：树莓派上判断是否跟得上实时
 PRUNE_INTERVAL = 20.0  # 清理旧分段的节流间隔
 SEGMENT_FLUSH_DELAY = 2.0  # 等 ffmpeg 把事件末尾的数据写进分段再剪
+DEBUG_CONFIDENCE = 0.1  # debug 模式用更低的阈值跑，把被 conf 过滤掉的猫也显示出来
+_gui_available = True  # headless 环境下置为 False，不要每帧都去试窗口
 
 
-def run(config: Config, source: str | None = None, dry_run: bool = False) -> None:
+def run(
+    config: Config, source: str | None = None, dry_run: bool = False, debug: bool = False
+) -> None:
     from ultralytics import YOLO  # 延迟导入：torch 启动慢，别拖累 --help
 
     source = source or config.camera_url
@@ -90,7 +94,8 @@ def run(config: Config, source: str | None = None, dry_run: bool = False) -> Non
                 continue
 
             detect_started = time.monotonic()
-            centers = _pet_centers(model, frame, config, class_ids)
+            result = _detect(model, frame, config, class_ids, debug)
+            centers = _pet_centers(result, config.detection_confidence)
             detect_seconds += time.monotonic() - detect_started
             detections += 1
 
@@ -108,6 +113,10 @@ def run(config: Config, source: str | None = None, dry_run: bool = False) -> Non
                 heartbeat_at, grabbed_frames, detections, detect_seconds = now, 0, 0, 0.0
 
             event = tracker.update(timestamp, centers)
+
+            if debug and not _show_debug_window(result, tracker, config, timestamp):
+                break  # 窗口里按了 q
+
             if event == "start":
                 # 事件起点往前推 CLIP_PRE_SECONDS，画面已经在录像里，不用内存缓冲。
                 event_started_at = _wall_clock(is_stream, timestamp) - config.clip_pre_seconds
@@ -218,16 +227,65 @@ def _pet_class_ids(names: dict[int, str], pet_classes: tuple[str, ...]) -> list[
     return ids
 
 
-def _pet_centers(model, frame, config: Config, class_ids: list[int]) -> list[tuple[float, float]]:
-    """返回归一化到 [0, 1] 的宠物检测框中心点。"""
-    result = model.predict(
+def _detect(model, frame, config: Config, class_ids: list[int], debug: bool):
+    return model.predict(
         frame,
         imgsz=config.detection_imgsz,
-        conf=config.detection_confidence,
+        conf=min(config.detection_confidence, DEBUG_CONFIDENCE) if debug else config.detection_confidence,
         classes=class_ids,
         verbose=False,
     )[0]
-    return [(float(x), float(y)) for x, y, _, _ in result.boxes.xywhn.tolist()]
+
+
+def _pet_centers(result, confidence: float) -> list[tuple[float, float]]:
+    """返回达到置信度阈值的宠物检测框中心点，归一化到 [0, 1]。"""
+    return [
+        (float(box[0]), float(box[1]))
+        for box, conf in zip(result.boxes.xywhn.tolist(), result.boxes.conf.tolist())
+        if conf >= confidence
+    ]
+
+
+def _show_debug_window(result, tracker: ActivityTracker, config: Config, timestamp: float) -> bool:
+    """画一帧诊断画面；返回 False 表示用户要退出。"""
+    detected = [
+        f"{result.names[int(cls)]} {conf:.2f}"
+        for cls, conf in zip(result.boxes.cls.tolist(), result.boxes.conf.tolist())
+    ]
+    passed = sum(1 for conf in result.boxes.conf.tolist() if conf >= config.detection_confidence)
+    cooldown_left = (
+        max(0.0, config.notification_cooldown_seconds - (timestamp - tracker.stopped_at))
+        if tracker.stopped_at is not None and not tracker.active
+        else 0.0
+    )
+    # 每行：文字 + 是否"这一项挡住了触发"（挡住的画红色）
+    lines = [
+        (f"detect {len(detected)} [{', '.join(detected[:3]) or 'none'}]", not detected),
+        (f"conf>={config.detection_confidence:.2f} passed {passed}", passed == 0),
+        (f"move {tracker.last_move:.4f} / {config.move_threshold:.4f}", tracker.last_move <= config.move_threshold),
+        (f"state {'RECORDING' if tracker.active else 'IDLE'}", False),
+        (f"cooldown {cooldown_left:.0f}s", cooldown_left > 0),
+    ]
+    log.debug(" | ".join(text for text, _ in lines))
+
+    global _gui_available
+    if not _gui_available:
+        return True
+
+    canvas = result.plot()  # ultralytics 自带画框，别自己写
+    for index, (text, blocking) in enumerate(lines):
+        cv2.putText(
+            canvas, text, (10, 24 + index * 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+            (0, 0, 255) if blocking else (0, 220, 0), 2, cv2.LINE_AA,
+        )
+    try:
+        cv2.imshow("catRecap debug (q to quit)", canvas)
+        return cv2.waitKey(1) & 0xFF != ord("q")
+    except cv2.error:
+        # 无 GUI 环境（树莓派 ssh、headless opencv）只留日志。
+        _gui_available = False
+        log.warning("当前环境打不开窗口，--debug 改为只输出诊断日志")
+        return True
 
 
 def _fps(capture) -> float:

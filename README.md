@@ -54,9 +54,35 @@ uv run catrecap run
 
 ```sh
 uv run catrecap run --dry-run                       # 照常录制和剪片，只是不推送
+uv run catrecap run --debug --dry-run               # 开窗口看检测和判定，排查"猫动了却没发"
 uv run catrecap run --source sample.mp4 --dry-run   # 回放本地视频调检测参数，片段直接从该文件剪
 uv run python -m unittest discover -s tests -v
 ```
+
+### `--debug`：为什么猫动了却没触发
+
+开一个实时窗口（ultralytics 画检测框）+ 每次检测一行日志，**红字就是挡住触发的那一项**：
+
+```text
+detect 1 [cat 0.31]            ← 低阈值下检到了什么。none = 模型根本没认出猫
+conf>=0.50 passed 0            ← 达到 DETECTION_CONFIDENCE 的框数。0 = 置信度不够，调低阈值
+move 0.0130 / 0.0200           ← 本次质心位移 / MOVE_THRESHOLD。偏小 = 猫动得不够"大"
+state IDLE                     ← IDLE / RECORDING
+cooldown 42s                   ← 冷却剩余。>0 时新活动不会触发，调小 NOTIFICATION_COOLDOWN_SECONDS
+```
+
+debug 模式下检测阈值临时降到 0.1，好让本来被过滤掉的框也显示出来；判定仍按 `.env` 的真实阈值走，
+所以看到的行为和正常运行一致。窗口按 `q` 退出，刷新率就是 `DETECTION_INTERVAL`（默认 0.4 秒一帧，
+看着卡是正常的，故意不改成每帧，否则复现不出真实判定节奏）。
+
+常见结论：
+- `detect none`：360p 里猫太小或夜视画面模型不认。试 `--source $RECORD_URL` 用 1080p 流跑检测，
+  或把 `DETECTION_IMGSZ` 调到 640。
+- `passed 0` 但 detect 有框：`DETECTION_CONFIDENCE` 降到 0.3 左右。
+- `move` 一直小于阈值：猫在原地小幅动作，`MOVE_THRESHOLD` 调到 0.01 或更小。
+- 一直 `cooldown`：上一段刚发完，属于预期，嫌少就调小冷却。
+
+在树莓派上 ssh 跑 `--debug` 打不开窗口时，会自动降级成只输出上面那行日志。
 
 首次运行会自动下载 `yolo11n.pt` 到工作目录。
 

@@ -65,6 +65,15 @@ class ActivityTrackerTest(unittest.TestCase):
         self.assertFalse(t.active)
         self.assertEqual(t.update(66.2, moved(0.2)), "start")
 
+    def test_exposes_last_move_for_debugging(self):
+        t = tracker()
+        t.update(0.0, CENTER)
+        self.assertEqual(t.last_move, 0.0)  # 没有上一帧，无从比较
+        t.update(1.0, moved(0.2))
+        self.assertAlmostEqual(t.last_move, 0.2)
+        t.update(2.0, [])
+        self.assertEqual(t.last_move, 0.0)  # 画面里没宠物
+
     def test_movement_uses_centroid_of_all_pets(self):
         t = tracker()
         self.assertIsNone(t.update(0.0, [(0.2, 0.5), (0.8, 0.5)]))
