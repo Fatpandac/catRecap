@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Detect pet activity in camera streams, extract clips, and send them to Telegram."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "requests>=2.34.2",
+    "ultralytics>=8.4.148",
+]
 
 [project.scripts]
 catrecap = "catrecap.__main__:main"

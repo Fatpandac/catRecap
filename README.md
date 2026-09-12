@@ -2,61 +2,77 @@
 
 从监控摄像头的视频流中识别宠物活动，截取活动片段并推送到 Telegram。
 
-## 当前状态
+## 处理流程
 
-仓库初始化阶段：已有 Python 包、CLI 入口、配置模板和基础测试。
-**尚未实现接流、YOLO 推理、活动判定、视频截取或 Telegram 推送。**
-当前 CLI 仅提供帮助和版本信息，不会连接摄像头或发送消息，也不会读取 `.env`。
+```text
+RTSP 视频流 → 每帧解码并进滚动缓冲 → 每隔 DETECTION_INTERVAL 跑一次 YOLO 检测猫/狗
+  → 检测框质心位移超过阈值即判定为活动 → 截取活动前后的片段写成 mp4
+  → Telegram Bot API sendVideo（后台线程，失败保留本地文件）
+```
 
-## 本地开发
+- 活动判定见 `src/catrecap/activity.py`：**位移即活动**，不区分吃饭、玩耍等具体行为。
+- 片段包含事件前 `CLIP_PRE_SECONDS` 秒（滚动缓冲）和停止活动后 `CLIP_POST_SECONDS` 秒；
+  `CLIP_MAX_SECONDS` 截断长事件，`NOTIFICATION_COOLDOWN_SECONDS` 防止刷屏。
+- 视频源断线会每 5 秒重连；Telegram 推送失败只记日志，片段留在 `OUTPUT_DIR`。
 
-使用 Python 3.12 和 [uv](https://docs.astral.sh/uv/getting-started/installation/)。
+## 使用
+
+需要 Python 3.12 和 [uv](https://docs.astral.sh/uv/getting-started/installation/)。
 
 ```sh
 uv sync --locked
-cp .env.example .env
-uv run catrecap --help
-uv run catrecap --version
+cp .env.example .env      # 填 CAMERA_URL / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+uv run catrecap run
+```
+
+调试用法：
+
+```sh
+uv run catrecap run --source sample.mp4 --dry-run   # 回放本地视频，只存片段不推送
+uv run catrecap run --source sample.mp4             # 回放并真的推送，验证 Telegram 链路
 uv run python -m unittest discover -s tests -v
 ```
 
-也可使用 `uv run python -m catrecap --help`。
+`--dry-run` 只跳过推送，仍会写片段到 `OUTPUT_DIR`。首次运行会自动下载 `yolo11n.pt` 到工作目录。
 
-初始化阶段不安装 PyTorch、YOLO 等较大依赖；接入推理时再根据运行设备选用 CPU、CUDA 或 MPS 环境，并锁定依赖。
+## 树莓派 5 部署
 
-## 计划中的处理流程
+```sh
+sudo apt install -y python3-pip
+curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone <repo> /home/pi/catRecap && cd /home/pi/catRecap
+uv sync --locked && cp .env.example .env && $EDITOR .env
+uv run catrecap run --dry-run       # 先确认能连上摄像头、能出片段
 
-```text
-摄像头 RTSP 视频流
-  → 解码 / 滚动缓冲
-  → YOLO 检测猫、狗
-  → 连续帧活动判定 / 事件合并
-  → 截取事件前后的视频，编码为 H.264 MP4
-  → Telegram Bot API sendVideo
+sudo cp deploy/catrecap.service /etc/systemd/system/
+sudo systemctl enable --now catrecap
+journalctl -u catrecap -f
 ```
 
-- 首版默认单摄像头、猫和狗，先跑通本地视频，再接实时 RTSP。
-- 检测计划使用 Ultralytics YOLO，初始模型为 `yolo11n.pt`；接入前确认其 AGPL-3.0 / 商业许可是否符合用途。
-- **目标检测不等于活动识别**：预训练 YOLO 可以定位猫狗，但不能直接判断吃饭、玩耍等行为。首版拟结合连续帧中的位置变化判断活动；具体行为分类需要额外模型或训练数据。
-- 视频处理计划使用 OpenCV / FFmpeg；事件前缓冲保留动作起点，结束延时合并短暂漏检，片段时长上限与推送冷却避免刷屏。
-- 推送直接使用 Telegram Bot API，不提前引入 Bot 框架、数据库或任务队列。实现时需限制文件大小、处理超时及限流，并保留发送失败的片段以便重试。
-- 接流实现需处理断线重连、时间戳和缓冲区上限；本地片段保留策略需防止磁盘持续增长。
+Pi 5 是纯 CPU 推理，torch 跑 `yolo11n.pt` 每帧约几十到上百毫秒。默认 `DETECTION_INTERVAL=0.4`、
+`DETECTION_IMGSZ=320` 就是为此留的余量；如果 CPU 吃紧，先调大这两个值，再考虑导出 NCNN：
 
-## 配置与隐私
+```sh
+uv run yolo export model=yolo11n.pt format=ncnn   # 生成 yolo11n_ncnn_model/
+# 然后把 .env 里的 YOLO_MODEL 指向这个目录
+```
 
-`.env.example` 记录后续实现拟采用的配置项，**目前仅为模板**，尚未进行运行时读取或校验。
+依赖里的 torch 占磁盘约 1GB，8GB 的 Pi 5 装得下；真嫌重可以改用 onnxruntime 自己做后处理，
+但那要多写检测框解码和 NMS，现在没必要。
 
-- `CAMERA_URL`：摄像头 RTSP 地址，可能包含账号密码。
-- `TELEGRAM_BOT_TOKEN`：通过 BotFather 创建的 Bot token。
-- `TELEGRAM_CHAT_ID`：接收消息的会话 ID；私聊需先与 Bot 发起会话，群组需先加入 Bot 并赋予发送权限。
-- 模型、检测类别、置信度、片段前后时长及冷却参数见模板。
+## 配置
 
-`.env`、视频、模型权重和运行输出已加入 `.gitignore`。不要将真实凭据写入源码、日志或测试；`.gitignore` 不是泄漏防护措施。Telegram 推送会将家庭监控片段上传至第三方，仅在明确授权的摄像头上使用。
+所有配置项和默认值见 `.env.example` 与 `src/catrecap/config.py`；同名环境变量优先于 `.env`。
+必填三项：`CAMERA_URL`、`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`（私聊需先与 Bot 发起会话，
+群组需先把 Bot 拉进去并给发送权限）。
 
-## 下一步
+`.env`、视频、模型权重和运行输出已在 `.gitignore` 中忽略。Telegram 推送会把家庭监控片段上传到
+第三方服务，只在自己有权限的摄像头上使用。
 
-1. 用本地样本验证 YOLO 检测及活动判定，明确是否仅关注移动还是需要具体行为分类。
-2. 接入 RTSP，完成有界缓冲、事件片段生成和断线恢复。
-3. 接入 Telegram，验证上传限制、失败保留和推送去重。
+## 已知限制
 
-真实链路验证需要摄像头地址或视频样本、运行设备信息，以及 Telegram Bot 配置。
+- 多只宠物用**所有检测框的质心**判断位移，两只同时反向移动会互相抵消；要区分个体得换成带 ID 的跟踪。
+- 片段按视频源上报的 fps 写入；摄像头 fps 不准或抽帧时，片段时长会与真实时间有偏差。
+- 优先用 H.264（`avc1`）编码，不可用时回落 `mp4v`，后者在部分客户端里不能内联预览。
+- 单条视频超过 Telegram 的 50MB 上限会推送失败，片段保留在本地。
+- 暂无失败重试、无多摄像头、无 Web 界面，真需要再说。
