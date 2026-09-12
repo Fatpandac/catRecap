@@ -1,15 +1,15 @@
-"""接视频流 → YOLO 检测宠物 → 截取活动片段 → 推送 Telegram。"""
+"""低清流抽帧跑 YOLO 判定活动，高清流由 ffmpeg 分段落盘，事件按时间戳无重编码剪片并推送。"""
 
 import logging
 import os
 import time
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
 import cv2
 
+from catrecap import recorder
 from catrecap.activity import ActivityTracker
 from catrecap.config import Config
 
@@ -18,6 +18,8 @@ log = logging.getLogger("catrecap")
 TELEGRAM_VIDEO_LIMIT = 50 * 1024 * 1024  # Bot API sendVideo 上限
 RECONNECT_DELAY = 5.0
 HEARTBEAT_SECONDS = 300.0  # 心跳日志间隔：树莓派上判断是否跟得上实时
+PRUNE_INTERVAL = 20.0  # 清理旧分段的节流间隔
+SEGMENT_FLUSH_DELAY = 2.0  # 等 ffmpeg 把事件末尾的数据写进分段再剪
 
 
 def run(config: Config, source: str | None = None, dry_run: bool = False) -> None:
@@ -41,15 +43,19 @@ def run(config: Config, source: str | None = None, dry_run: bool = False) -> Non
         max_seconds=config.clip_max_seconds,
         cooldown=config.notification_cooldown_seconds,
     )
-    sender = ThreadPoolExecutor(max_workers=1, thread_name_prefix="telegram")
-    capture = writer = None
-    clip_path = None
+    worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="clip")
+    recording = _Recording(config, source) if is_stream else None
+    capture = None
+    event_started_at = 0.0
     frame_index = 0
     last_detection_at = -1e9
-    heartbeat_at, heartbeat_frames, detections, detect_seconds = time.monotonic(), 0, 0, 0.0
+    heartbeat_at, grabbed_frames, detections, detect_seconds = time.monotonic(), 0, 0, 0.0
 
     try:
         while True:
+            if recording is not None:
+                recording.tick()
+
             if capture is None:
                 capture = cv2.VideoCapture(source)
                 if not capture.isOpened():
@@ -59,11 +65,10 @@ def run(config: Config, source: str | None = None, dry_run: bool = False) -> Non
                     time.sleep(RECONNECT_DELAY)
                     continue
                 fps = _fps(capture)
-                buffer = deque(maxlen=max(1, round(fps * config.clip_pre_seconds)))
-                log.info("已连接视频源，fps=%.1f", fps)
+                log.info("已连接检测流，fps=%.1f", fps)
 
-            ok, frame = capture.read()
-            if not ok:
+            # 只 grab 不 retrieve：非采样帧不做色彩转换和拷贝，也不让流缓冲堆积。
+            if not capture.grab():
                 capture.release()
                 capture = None
                 if not is_stream:
@@ -73,16 +78,16 @@ def run(config: Config, source: str | None = None, dry_run: bool = False) -> Non
                 continue
 
             frame_index += 1
-            heartbeat_frames += 1
+            grabbed_frames += 1
             # 实时流用墙钟时间，丢帧不会让时间轴变慢；本地文件按帧号推算。
             timestamp = time.monotonic() if is_stream else frame_index / fps
-            buffer.append(frame)
-            if writer is not None:
-                writer.write(frame)
-
             if timestamp - last_detection_at < config.detection_interval:
                 continue
             last_detection_at = timestamp
+
+            ok, frame = capture.retrieve()
+            if not ok:
+                continue
 
             detect_started = time.monotonic()
             centers = _pet_centers(model, frame, config, class_ids)
@@ -93,40 +98,117 @@ def run(config: Config, source: str | None = None, dry_run: bool = False) -> Non
             if now - heartbeat_at >= HEARTBEAT_SECONDS:
                 elapsed = now - heartbeat_at
                 log.info(
-                    "心跳：处理 %.1f 帧/秒（源 %.1f），推理 %.0fms/次，当前画面宠物 %d 只",
-                    heartbeat_frames / elapsed,
+                    "心跳：抽帧 %.1f 帧/秒（源 %.1f），推理 %.0fms/次，当前画面宠物 %d 只，录像占用 %s",
+                    grabbed_frames / elapsed,
                     fps,
                     detect_seconds / max(detections, 1) * 1000,
                     len(centers),
+                    _disk_usage(config.segment_dir) if recording else "-",
                 )
-                heartbeat_at, heartbeat_frames, detections, detect_seconds = now, 0, 0, 0.0
+                heartbeat_at, grabbed_frames, detections, detect_seconds = now, 0, 0, 0.0
 
             event = tracker.update(timestamp, centers)
             if event == "start":
-                clip_path = config.output_dir / f"pet-{datetime.now():%Y%m%d-%H%M%S}.mp4"
-                writer = _open_writer(clip_path, fps, frame)
-                if writer is None:
-                    log.error("无法创建视频文件 %s，跳过本次事件", clip_path)
-                    tracker.active = False
-                    continue
-                for buffered in buffer:  # 事件前若干秒，保留动作起点
-                    writer.write(buffered)
-                log.info("检测到宠物活动，开始录制 %s", clip_path.name)
-            elif event == "stop" and writer is not None:
-                writer.release()
-                writer = None
-                log.info("活动结束，已保存 %s", clip_path.name)
-                if dry_run:
-                    log.info("dry-run：跳过 Telegram 推送")
-                else:
-                    sender.submit(_send_safely, config, clip_path)
+                # 事件起点往前推 CLIP_PRE_SECONDS，画面已经在录像里，不用内存缓冲。
+                event_started_at = _wall_clock(is_stream, timestamp) - config.clip_pre_seconds
+                log.info("检测到宠物活动，标记起点 %s", _fmt(event_started_at))
+            elif event == "stop":
+                event_ended_at = _wall_clock(is_stream, timestamp)
+                worker.submit(
+                    _clip_and_send, config, recording, source, event_started_at, event_ended_at, dry_run
+                )
     finally:
-        if writer is not None:
-            writer.release()
-            log.info("退出前保存 %s", clip_path.name)
         if capture is not None:
             capture.release()
-        sender.shutdown(wait=True)
+        worker.shutdown(wait=True)
+        if recording is not None:
+            recording.stop()
+
+
+class _Recording:
+    """管理 ffmpeg 分段录制子进程，并按时长/体积/磁盘余量清理旧分段。"""
+
+    def __init__(self, config: Config, detection_source: str):
+        self.config = config
+        self.url = config.record_url or detection_source
+        self.process = None
+        self.pruned_at = 0.0
+        self._start()
+
+    def _start(self) -> None:
+        self.process = recorder.start_recording(
+            self.url, self.config.segment_dir, self.config.segment_seconds
+        )
+        log.info("已启动高清录像，分段目录 %s", self.config.segment_dir)
+
+    def tick(self) -> None:
+        if self.process.poll() is not None:  # ffmpeg 挂了（断流、摄像头重启）
+            log.warning("录像进程退出（code=%s），重启", self.process.returncode)
+            time.sleep(RECONNECT_DELAY)
+            self._start()
+        now = time.monotonic()
+        if now - self.pruned_at >= PRUNE_INTERVAL:
+            self.pruned_at = now
+            recorder.prune_segments(
+                self.config.segment_dir,
+                keep_seconds=self.config.segment_keep_minutes * 60,
+                max_bytes=int(self.config.segment_max_mb * 1024 * 1024),
+                min_free_bytes=int(self.config.disk_min_free_mb * 1024 * 1024),
+            )
+
+    def stop(self) -> None:
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=10)
+        except Exception:
+            self.process.kill()
+
+
+def _clip_and_send(
+    config: Config,
+    recording: "_Recording | None",
+    source: str,
+    start: float,
+    end: float,
+    dry_run: bool,
+) -> None:
+    try:
+        # 文件回放模式下 start 是片内偏移，不是墙钟时间，用当前时间命名。
+        named_at = start if recording is not None else time.time()
+        clip_path = config.output_dir / f"pet-{datetime.fromtimestamp(named_at):%Y%m%d-%H%M%S}.mp4"
+        # end 是 tracker 判定停止的时刻，本身已含 CLIP_POST_SECONDS 的静止尾巴，不能再加一次，
+        # 否则会去剪一段还没录到的“未来”，ffmpeg 只会把片段截短。
+        if recording is not None:
+            time.sleep(SEGMENT_FLUSH_DELAY)  # 事件末尾可能还在 ffmpeg 的写缓冲里
+            ok = recorder.cut_clip(config.segment_dir, start, end, clip_path)
+        else:
+            ok = recorder.cut_file(Path(source), start, end, clip_path)
+        if not ok:
+            return
+        log.info("已剪出 %s（目标 %.0f 秒）", clip_path.name, end - start)
+        if dry_run:
+            log.info("dry-run：跳过 Telegram 推送")
+            return
+        send_to_telegram(config, clip_path)
+        clip_path.unlink(missing_ok=True)  # 推送成功就删本地副本，避免 output_dir 无限增长
+        log.info("已推送 %s", clip_path.name)
+    except Exception:
+        # 推送失败保留本地文件，便于手动补发；失败不能拖垮取流循环。
+        log.exception("剪辑或推送失败")
+
+
+def _wall_clock(is_stream: bool, timestamp: float) -> float:
+    # 流模式下 timestamp 是 monotonic，换算成剪辑需要的墙钟时间；文件模式本来就是片内偏移。
+    return time.time() - (time.monotonic() - timestamp) if is_stream else timestamp
+
+
+def _fmt(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch).strftime("%H:%M:%S")
+
+
+def _disk_usage(directory: Path) -> str:
+    total = sum(path.stat().st_size for path, _ in recorder.list_segments(directory))
+    return f"{total / 1024 / 1024:.0f}MB"
 
 
 def _pet_class_ids(names: dict[int, str], pet_classes: tuple[str, ...]) -> list[int]:
@@ -152,25 +234,6 @@ def _fps(capture) -> float:
     fps = capture.get(cv2.CAP_PROP_FPS)
     # 有些摄像头不报 fps 或报 0/nan，按 15 兜底，必要时按实际设备调。
     return fps if 0 < fps < 120 else 15.0
-
-
-def _open_writer(path: Path, fps: float, frame):
-    height, width = frame.shape[:2]
-    for codec in ("avc1", "mp4v"):  # H.264 优先，Telegram 里能直接预览
-        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*codec), fps, (width, height))
-        if writer.isOpened():
-            return writer
-        writer.release()
-    return None
-
-
-def _send_safely(config: Config, clip_path: Path) -> None:
-    try:
-        send_to_telegram(config, clip_path)
-        log.info("已推送 %s", clip_path.name)
-    except Exception:
-        # 推送失败保留本地文件，便于手动补发；失败不能拖垮取流循环。
-        log.exception("推送失败，片段保留在 %s", clip_path)
 
 
 def send_to_telegram(config: Config, clip_path: Path) -> None:

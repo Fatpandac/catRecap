@@ -7,9 +7,11 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class Config:
-    camera_url: str
+    camera_url: str  # 低分辨率通道，只用来跑检测
     telegram_bot_token: str
     telegram_chat_id: str
+    # 高清通道，ffmpeg 以 -c copy 持续分段落盘，片段从这里剪；留空则直接录检测流。
+    record_url: str = ""
     # 默认值同时作为 .env 缺省时的回退，字段名大写即对应环境变量名。
     yolo_model: str = "yolo11n.pt"
     pet_classes: tuple[str, ...] = ("cat", "dog")
@@ -22,6 +24,12 @@ class Config:
     move_threshold: float = 0.02  # 归一化画面坐标下的质心位移阈值
     notification_cooldown_seconds: float = 60.0
     output_dir: Path = Path("data/clips")
+    # 滚动录像：三道防线同时生效，哪道先到就从最旧的段开始删。
+    segment_dir: Path = Path("data/segments")
+    segment_seconds: float = 30.0
+    segment_keep_minutes: float = 10.0
+    segment_max_mb: float = 2048.0
+    disk_min_free_mb: float = 1024.0
 
 
 def load_config(env_path: Path = Path(".env"), environ=None) -> Config:

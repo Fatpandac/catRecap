@@ -1,5 +1,7 @@
 [Unit]
 Description=CatRecap pet activity clipper
+Documentation=https://github.com/fatpandac/catRecap
+# 需要 ffmpeg：sudo apt install -y ffmpeg
 After=network-online.target
 Wants=network-online.target
 
@@ -9,7 +11,8 @@ WorkingDirectory=/home/pi/catRecap
 ExecStart=/home/pi/.local/bin/uv run --locked catrecap run
 Restart=always
 RestartSec=10
-# 摄像头断线、Telegram 超时都在进程内自愈，这里兜底进程级崩溃。
+# 摄像头断线、ffmpeg 录制进程退出、Telegram 超时都在进程内自愈，这里兜底进程级崩溃。
+# 录像分段默认写在 WorkingDirectory 下的 data/segments，SEGMENT_* 三道防线负责不写满盘。
 
 [Install]
 WantedBy=multi-user.target
