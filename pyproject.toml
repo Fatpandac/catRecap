@@ -7,7 +7,19 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "requests>=2.34.2",
     "ultralytics>=8.4.148",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
 ]
+
+# 树莓派不需要 CUDA；显式选择 ARM Linux CPU wheels，其他平台保留 PyPI 默认包。
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [project.scripts]
 catrecap = "catrecap.__main__:main"

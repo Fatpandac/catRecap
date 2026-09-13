@@ -188,7 +188,8 @@ uv run yolo export model=yolo11n.pt format=ncnn   # 生成 yolo11n_ncnn_model/
 # 然后把 .env 里的 YOLO_MODEL 指向这个目录
 ```
 
-torch 占磁盘约 1GB，8GB 的 Pi 5 装得下。
+ARM Linux 已在 `pyproject.toml` 中指定官方 CPU 版 torch/torchvision，`uv sync --locked` 不会为树莓派安装 CUDA/NVIDIA 依赖。
+服务文件里的 `User` 和 `/home/pi` 路径需替换为实际部署用户；也可直接用项目的 `.venv/bin/catrecap run` 作为 `ExecStart`，启动服务时无需重新同步依赖。
 
 ## 配置
 
