@@ -83,6 +83,21 @@ class MotionPipelineTest(unittest.TestCase):
                 pipeline.run(config, dry_run=True)
             self.assertEqual(clips.call_count, 0, "人体区域内的运动不应触发剪辑")
 
+    def test_active_event_is_clipped_at_file_end(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "unfinished.avi"
+            moving_video(source)
+            config = Config(
+                str(source), "unused", "unused", output_dir=Path(temp) / "clips",
+                trigger_mode="motion", motion_ignore_people=False,
+                detection_interval=.1, clip_pre_seconds=1, clip_post_seconds=20,
+            )
+            with patch.object(pipeline, "_clip_and_send") as clips:
+                pipeline.run(config, dry_run=True)
+            self.assertEqual(clips.call_count, 1)
+            self.assertLess(clips.call_args.args[3], 5)
+            self.assertAlmostEqual(clips.call_args.args[4], 10)
+
     def test_debug_reports_sending_enabled_without_sending(self):
         config = Config("unused", "unused", "unused")
         tracker = pipeline.ActivityTracker(0.02, 5, 30, 60)

@@ -107,7 +107,7 @@ MOTION_CONFIRM_FRAMES=2
 按 `q` 退出窗口；`--dry-run` 仍会录制和保存片段，但不会发送。debug 的 `delivery SAVE ONLY (--dry-run)`
 表示禁止发送，`delivery TELEGRAM ON (after event ends)` 表示事件结束后才会剪辑并尝试推送，**不代表已经发送成功**。
 需要真正推送请去掉 `--dry-run`，使用 `uv run catrecap run --debug` 并重启进程。
-通用 motion 不画猫框；pet_motion 画黄色宠物框和框内绿色运动区域，`ACTIVE` 表示事件进行中。退出时尚未结束的事件目前不会提交剪辑。
+通用 motion 不画猫框；pet_motion 画黄色宠物框和框内绿色运动区域，`ACTIVE` 表示事件进行中。本地文件自然播放结束时会收尾剪辑；手动退出时尚未结束的事件目前不会提交剪辑。
 `--dry-run` 与发送失败留下的片段没有自动清理，调试后请检查 `OUTPUT_DIR`，避免长期积累。
 
 ### 已标记的真实视频回归
@@ -119,7 +119,7 @@ CATRECAP_SAMPLE_TESTS=1 uv run python -m unittest discover -s tests -p test_labe
 ```
 
 - `data/clips/pet-20260912-204107.mp4`：猫未活动，期望 0 个事件。
-- `data/clips/pet-20260912-141219.mp4`：猫在人的脚边走动，期望 1 个事件，剪辑范围约 7.85～16.05 秒（包含预录）。
+- `data/clips/pet-20260912-141219.mp4`：猫在人的脚边走动，期望 1 个事件，覆盖约 12 秒或 25 秒的猫活动；不同平台首次确认时刻可能不同。
 - 测试真实解码、YOLO 和事件判定，仅拦截剪辑/上传；普通测试默认跳过这两个需要私有视频与本地权重的用例。
 - 这两段用于修复回归，不是独立准确率评估集；不能据此保证其他光照、机位、遮挡下不漏检。树莓派实际推理耗时仍需实机测量。
 
@@ -188,7 +188,7 @@ uv run yolo export model=yolo11n.pt format=ncnn   # 生成 yolo11n_ncnn_model/
 # 然后把 .env 里的 YOLO_MODEL 指向这个目录
 ```
 
-ARM Linux 已在 `pyproject.toml` 中指定官方 CPU 版 torch/torchvision，`uv sync --locked` 不会为树莓派安装 CUDA/NVIDIA 依赖。
+ARM Linux 已在 `pyproject.toml` 中指定官方 CPU 版 torch/torchvision，`uv sync --locked` 不会为树莓派安装 CUDA 运行库。
 服务文件里的 `User` 和 `/home/pi` 路径需替换为实际部署用户；也可直接用项目的 `.venv/bin/catrecap run` 作为 `ExecStart`，启动服务时无需重新同步依赖。
 
 ## 配置

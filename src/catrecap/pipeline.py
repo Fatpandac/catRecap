@@ -98,6 +98,12 @@ def run(
                 capture.release()
                 capture = None
                 if not is_stream:
+                    # 文件结束就收尾，不能等待一段已经不存在的静止尾巴。
+                    if tracker.active:
+                        worker.submit(
+                            _clip_and_send, config, recording, source,
+                            event_started_at, frame_index / fps, dry_run,
+                        )
                     break  # 本地文件播放结束
                 log.warning("视频流中断，%.0fs 后重连", RECONNECT_DELAY)
                 time.sleep(RECONNECT_DELAY)
