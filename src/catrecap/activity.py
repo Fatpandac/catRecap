@@ -1,4 +1,4 @@
-"""宠物活动判定：基于检测框质心在采样帧之间的位移。"""
+"""活动事件起停：接收运动标记，或根据检测框质心位移判定。"""
 
 from dataclasses import dataclass, field
 from math import dist
@@ -23,8 +23,10 @@ class ActivityTracker:
     stopped_at: float | None = None
     _last_centroid: tuple[float, float] | None = field(default=None, repr=False)
 
-    def update(self, timestamp: float, centers: list[tuple[float, float]]) -> str | None:
-        """喂入一帧的宠物中心点，返回 "start"、"stop" 或 None。"""
+    def update(
+        self, timestamp: float, centers: list[tuple[float, float]], moving: bool | None = None
+    ) -> str | None:
+        """返回 "start"、"stop" 或 None；显式 moving 标记优先于质心判定。"""
         # ponytail: 用全部检测框的质心代表画面，多宠物同时反向移动会互相抵消；
         # 真要区分每只宠物，换成带 ID 的跟踪器（YOLO track）再按轨迹判断。
         centroid = _centroid(centers)
@@ -33,7 +35,8 @@ class ActivityTracker:
             if centroid is not None and self._last_centroid is not None
             else 0.0
         )
-        moving = self.last_move > self.move_threshold
+        if moving is None:
+            moving = self.last_move > self.move_threshold
         self._last_centroid = centroid
 
         if self.active:

@@ -63,6 +63,41 @@ class LoadConfigTest(unittest.TestCase):
                     load_config(write_env(text), environ={})
                 self.assertIn(missing, str(ctx.exception))
 
+    def test_pet_motion_is_default_and_yolo_remains_selectable(self):
+        self.assertEqual(load_config(write_env(MINIMAL), environ={}).trigger_mode, "pet_motion")
+        config = load_config(
+            write_env(MINIMAL),
+            environ={"TRIGGER_MODE": "yolo", "MOTION_MIN_RATIO": "0.002"},
+        )
+        self.assertEqual(config.trigger_mode, "yolo")
+        self.assertEqual(config.motion_min_ratio, 0.002)
+
+    def test_person_filter_defaults_on_and_can_be_disabled(self):
+        config = load_config(write_env(MINIMAL), environ={})
+        self.assertTrue(config.motion_ignore_people)
+        config = load_config(write_env(MINIMAL), environ={"MOTION_IGNORE_PEOPLE": "false"})
+        self.assertIs(config.motion_ignore_people, False)
+        with self.assertRaisesRegex(ValueError, "MOTION_IGNORE_PEOPLE"):
+            load_config(write_env(MINIMAL), environ={"MOTION_IGNORE_PEOPLE": "typo"})
+
+    def test_rejects_invalid_motion_settings(self):
+        for values, key in (
+            ({"TRIGGER_MODE": "typo"}, "TRIGGER_MODE"),
+            ({"MOTION_MIN_RATIO": "0"}, "MOTION_MIN_RATIO"),
+            ({"MOTION_MIN_RATIO": "nan"}, "MOTION_MIN_RATIO"),
+            ({"MOTION_MIN_RATIO": "0.6", "MOTION_MAX_RATIO": "0.5"}, "MOTION_MIN_RATIO"),
+            ({"MOTION_MAX_RATIO": "1.1"}, "MOTION_MIN_RATIO"),
+            ({"MOTION_WARMUP_FRAMES": "-1"}, "MOTION_WARMUP_FRAMES"),
+            ({"MOTION_PIXEL_THRESHOLD": "0"}, "MOTION_PIXEL_THRESHOLD"),
+            ({"MOTION_PIXEL_THRESHOLD": "256"}, "MOTION_PIXEL_THRESHOLD"),
+            ({"MOTION_PERSON_CONFIDENCE": "nan"}, "MOTION_PERSON_CONFIDENCE"),
+            ({"MOTION_PERSON_MARGIN": "-0.1"}, "MOTION_PERSON_MARGIN"),
+            ({"MOTION_PERSON_MARGIN": "nan"}, "MOTION_PERSON_MARGIN"),
+            ({"MOTION_CONFIRM_FRAMES": "0"}, "MOTION_CONFIRM_FRAMES"),
+        ):
+            with self.subTest(values=values), self.assertRaisesRegex(ValueError, key):
+                load_config(write_env(MINIMAL), environ=values)
+
     def test_invalid_number_names_the_key(self):
         with self.assertRaises(ValueError) as ctx:
             load_config(write_env(MINIMAL + "DETECTION_CONFIDENCE=high\n"), environ={})

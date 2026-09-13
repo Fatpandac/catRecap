@@ -13,6 +13,15 @@ class Config:
     # 高清通道，ffmpeg 以 -c copy 持续分段落盘，片段从这里剪；留空则直接录检测流。
     record_url: str = ""
     # 默认值同时作为 .env 缺省时的回退，字段名大写即对应环境变量名。
+    trigger_mode: str = "pet_motion"  # 必须识别到宠物且其框内有运动，未知运动不触发
+    motion_min_ratio: float = 0.0008
+    motion_max_ratio: float = 0.5
+    motion_warmup_frames: int = 15
+    motion_ignore_people: bool = True
+    motion_person_confidence: float = 0.4
+    motion_person_margin: float = 0.5
+    motion_pixel_threshold: int = 15
+    motion_confirm_frames: int = 2
     yolo_model: str = "yolo11n.pt"
     pet_classes: tuple[str, ...] = ("cat", "dog")
     detection_confidence: float = 0.5
@@ -30,6 +39,22 @@ class Config:
     segment_keep_minutes: float = 10.0
     segment_max_mb: float = 2048.0
     disk_min_free_mb: float = 1024.0
+
+    def __post_init__(self):
+        if self.trigger_mode not in ("pet_motion", "motion", "yolo"):
+            raise ValueError("TRIGGER_MODE 必须是 pet_motion、motion 或 yolo")
+        if not 0 < self.motion_min_ratio < self.motion_max_ratio <= 1:
+            raise ValueError("需满足 0 < MOTION_MIN_RATIO < MOTION_MAX_RATIO <= 1")
+        if self.motion_warmup_frames < 0:
+            raise ValueError("MOTION_WARMUP_FRAMES 不能小于 0")
+        if not 0 < self.motion_person_confidence <= 1:
+            raise ValueError("MOTION_PERSON_CONFIDENCE 需在 (0, 1] 内")
+        if not 0 < self.motion_pixel_threshold <= 255:
+            raise ValueError("MOTION_PIXEL_THRESHOLD 需在 [1, 255] 内")
+        if not 0 <= self.motion_person_margin <= 1:
+            raise ValueError("MOTION_PERSON_MARGIN 需在 [0, 1] 内")
+        if self.motion_confirm_frames < 1:
+            raise ValueError("MOTION_CONFIRM_FRAMES 不能小于 1")
 
 
 def load_config(env_path: Path = Path(".env"), environ=None) -> Config:
@@ -62,6 +87,10 @@ def _read_env_file(path: Path) -> dict[str, str]:
 
 def _convert(name: str, type_, raw: str):
     try:
+        if type_ is bool:
+            if raw.lower() not in ("true", "false"):
+                raise ValueError("请使用 true 或 false")
+            return raw.lower() == "true"
         if type_ is float:
             return float(raw)
         if type_ is int:

@@ -1,4 +1,4 @@
-"""低清流抽帧跑 YOLO 判定活动，高清流由 ffmpeg 分段落盘，事件按时间戳无重编码剪片并推送。"""
+"""低清流检测运动或运行 YOLO，高清流按事件时间戳无重编码剪片并推送。"""
 
 import logging
 import os
@@ -12,6 +12,8 @@ import cv2
 from catrecap import recorder
 from catrecap.activity import ActivityTracker
 from catrecap.config import Config
+from catrecap.detection import detect_moving_pets, qualified_boxes as _qualified_boxes
+from catrecap.motion import MotionDetector
 
 log = logging.getLogger("catrecap")
 
@@ -27,8 +29,6 @@ _gui_available = True  # headless 环境下置为 False，不要每帧都去试�
 def run(
     config: Config, source: str | None = None, dry_run: bool = False, debug: bool = False
 ) -> None:
-    from ultralytics import YOLO  # 延迟导入：torch 启动慢，别拖累 --help
-
     source = source or config.camera_url
     is_stream = "://" in source
     if is_stream:
@@ -37,8 +37,20 @@ def run(
         # 起播时 FFmpeg 会刷一堆 non-existing PPS / decode_slice_header 噪音，只留 fatal。
         os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "8")
 
-    model = YOLO(config.yolo_model)
-    class_ids = _pet_class_ids(model.names, config.pet_classes)
+    model, class_ids, person_ids, motion = None, [], [], None
+    if config.trigger_mode != "motion" or config.motion_ignore_people:
+        from ultralytics import YOLO
+
+        model = YOLO(config.yolo_model)
+        if config.trigger_mode != "motion":
+            class_ids = _pet_class_ids(model.names, config.pet_classes)
+        if config.trigger_mode == "motion" and config.motion_ignore_people:
+            person_ids = _pet_class_ids(model.names, ("person",))
+    log.info("触发模式：%s", config.trigger_mode)
+    if config.trigger_mode == "motion":
+        log.warning("motion 是通用运动模式，不能确认宠物；只关注宠物请使用 pet_motion")
+    if dry_run:
+        log.warning("dry-run：仅保存片段，不发送 Telegram；需要推送请移除 --dry-run 并重启")
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
     tracker = ActivityTracker(
@@ -69,6 +81,16 @@ def run(
                     time.sleep(RECONNECT_DELAY)
                     continue
                 fps = _fps(capture)
+                if config.trigger_mode in ("motion", "pet_motion"):
+                    # 每次重连重新学习背景，避免旧画面触发伪事件。
+                    motion = MotionDetector(
+                        min_ratio=config.motion_min_ratio,
+                        max_ratio=config.motion_max_ratio,
+                        warmup_frames=config.motion_warmup_frames,
+                        pixel_threshold=config.motion_pixel_threshold,
+                        person_margin=config.motion_person_margin,
+                        confirm_frames=config.motion_confirm_frames,
+                    )
                 log.info("已连接检测流，fps=%.1f", fps)
 
             # 只 grab 不 retrieve：非采样帧不做色彩转换和拷贝，也不让流缓冲堆积。
@@ -94,8 +116,32 @@ def run(
                 continue
 
             detect_started = time.monotonic()
-            result = _detect(model, frame, config, class_ids, debug)
-            centers = _pet_centers(result, class_ids, config.detection_confidence)
+            result, centers, moving = None, [], None
+            if config.trigger_mode == "pet_motion":
+                # 识别原图最大宽 1280，前景图最大宽 640（16:9 时分别为 720p/360p）。
+                # 本地 1080p 回放与摄像头 ch2 走相同预处理，避免离线和实机阈值不一致。
+                height, width = frame.shape[:2]
+                original = cv2.resize(frame, (1280, round(height * 1280 / width))) if width > 1280 else frame
+                height, width = original.shape[:2]
+                frame = cv2.resize(original, (640, round(height * 640 / width))) if width > 640 else original
+                mask = motion.prepare(frame)
+                pet_boxes = []
+                if motion.frames > motion.warmup_frames:
+                    pet_boxes = detect_moving_pets(model, original, mask, config, class_ids)
+                # 已确认的猫可在人脚边，不能再被扩大的“人体排除区”清掉。
+                moving = motion.evaluate(required_boxes=pet_boxes)
+            elif motion is not None:
+                ignored_boxes = []
+                if model is not None:
+                    result = _detect(
+                        model, frame, config, person_ids, False,
+                        confidence=config.motion_person_confidence,
+                    )
+                    ignored_boxes = _qualified_boxes(result, person_ids, config.motion_person_confidence)
+                moving = motion.update(frame, ignored_boxes=ignored_boxes)
+            else:
+                result = _detect(model, frame, config, class_ids, debug)
+                centers = _pet_centers(result, class_ids, config.detection_confidence)
             detect_seconds += time.monotonic() - detect_started
             detections += 1
 
@@ -103,24 +149,27 @@ def run(
             if now - heartbeat_at >= HEARTBEAT_SECONDS:
                 elapsed = now - heartbeat_at
                 log.info(
-                    "心跳：抽帧 %.1f 帧/秒（源 %.1f），推理 %.0fms/次，当前画面宠物 %d 只，录像占用 %s",
+                    "心跳：读取 %.1f 帧/秒（源 %.1f），检测 %.0fms/次，%s，录像占用 %s",
                     grabbed_frames / elapsed,
                     fps,
                     detect_seconds / max(detections, 1) * 1000,
-                    len(centers),
+                    f"变化占比 {motion.last_ratio:.3%}" if motion else f"宠物 {len(centers)} 只",
                     _disk_usage(config.segment_dir) if recording else "-",
                 )
                 heartbeat_at, grabbed_frames, detections, detect_seconds = now, 0, 0, 0.0
 
-            event = tracker.update(timestamp, centers)
+            event = tracker.update(timestamp, centers, moving=moving)
 
-            if debug and not _show_debug_window(result, class_ids, tracker, config, timestamp):
+            if debug and not _show_debug_window(
+                result, class_ids, tracker, config, timestamp,
+                motion=motion, frame=frame, dry_run=dry_run,
+            ):
                 break  # 窗口里按了 q
 
             if event == "start":
                 # 事件起点往前推 CLIP_PRE_SECONDS，画面已经在录像里，不用内存缓冲。
                 event_started_at = _wall_clock(is_stream, timestamp) - config.clip_pre_seconds
-                log.info("检测到宠物活动，标记起点 %s", _fmt(event_started_at))
+                log.info("检测到活动（%s），标记起点 %s", config.trigger_mode, _fmt(event_started_at))
             elif event == "stop":
                 event_ended_at = _wall_clock(is_stream, timestamp)
                 worker.submit(
@@ -129,6 +178,8 @@ def run(
     finally:
         if capture is not None:
             capture.release()
+        if debug and _gui_available:
+            cv2.destroyAllWindows()
         worker.shutdown(wait=True)
         if recording is not None:
             recording.stop()
@@ -227,12 +278,13 @@ def _pet_class_ids(names: dict[int, str], pet_classes: tuple[str, ...]) -> list[
     return ids
 
 
-def _detect(model, frame, config: Config, class_ids: list[int], debug: bool):
+def _detect(model, frame, config: Config, class_ids: list[int], debug: bool, *, confidence=None):
     # debug 时不限类别、阈值放到很低：否则分不清“模型什么都没看到”和“把猫认成了别的”。
+    confidence = config.detection_confidence if confidence is None else confidence
     return model.predict(
         frame,
         imgsz=config.detection_imgsz,
-        conf=min(config.detection_confidence, DEBUG_CONFIDENCE) if debug else config.detection_confidence,
+        conf=min(confidence, DEBUG_CONFIDENCE) if debug else confidence,
         classes=None if debug else class_ids,
         verbose=False,
     )[0]
@@ -250,30 +302,58 @@ def _pet_centers(result, class_ids: list[int], confidence: float) -> list[tuple[
 
 
 def _show_debug_window(
-    result, class_ids: list[int], tracker: ActivityTracker, config: Config, timestamp: float
+    result, class_ids: list[int], tracker: ActivityTracker, config: Config, timestamp: float,
+    *, motion: MotionDetector | None = None, frame=None, dry_run: bool = False,
 ) -> bool:
     """画一帧诊断画面；返回 False 表示用户要退出。"""
-    boxes = list(zip(result.boxes.cls.tolist(), result.boxes.conf.tolist()))
-    detected = [f"{result.names[int(c)]} {v:.2f}" for c, v in boxes if int(c) in class_ids]
-    others = sorted(
-        (f"{result.names[int(c)]} {v:.2f}" for c, v in boxes if int(c) not in class_ids),
-        key=lambda text: -float(text.split()[-1]),
-    )
-    passed = sum(1 for c, v in boxes if int(c) in class_ids and v >= config.detection_confidence)
+    if motion is not None:
+        warming = motion.frames <= motion.warmup_frames
+        within_range = motion.min_ratio <= motion.last_ratio <= motion.max_ratio
+        lines = [(f"mode {config.trigger_mode}", False)]
+        if config.trigger_mode == "pet_motion":
+            lines += [
+                (f"pet boxes >= {config.detection_confidence:.2f}: {len(motion.pet_boxes)} (yellow)",
+                 not motion.pet_boxes),
+                ("NO PET: NO TRIGGER" if not motion.pet_boxes else "pet region motion required", not motion.pet_boxes),
+            ]
+        else:
+            lines.append(("NO PET CONFIRMATION", False))
+        lines += [
+            (("local pet detection; pet boxes take priority" if config.trigger_mode == "pet_motion" else
+              f"person filter {'ON' if config.motion_ignore_people else 'OFF'}; masked regions {len(motion.ignored_boxes)} (blue)"), False),
+            (f"warmup {min(motion.frames, motion.warmup_frames)}/{motion.warmup_frames}"
+             f" {'WARMUP' if warming else 'READY'}", warming),
+            (f"changed {motion.last_ratio:.3%} / min {motion.min_ratio:.3%}"
+             f" max {motion.max_ratio:.1%}", not within_range),
+            (f"confirm {min(motion.consecutive_frames, motion.confirm_frames)}/{motion.confirm_frames}",
+             motion.consecutive_frames < motion.confirm_frames),
+        ]
+    else:
+        boxes = list(zip(result.boxes.cls.tolist(), result.boxes.conf.tolist()))
+        detected = [f"{result.names[int(c)]} {v:.2f}" for c, v in boxes if int(c) in class_ids]
+        others = sorted(
+            (f"{result.names[int(c)]} {v:.2f}" for c, v in boxes if int(c) not in class_ids),
+            key=lambda text: -float(text.split()[-1]),
+        )
+        passed = sum(1 for c, v in boxes if int(c) in class_ids and v >= config.detection_confidence)
+        lines = [
+            (f"pet {len(detected)} [{', '.join(detected[:3]) or 'none'}]", not detected),
+            (f"other [{', '.join(others[:3]) or 'none'}]", False),
+            (f"conf>={config.detection_confidence:.2f} passed {passed}", passed == 0),
+            (f"move {tracker.last_move:.4f} / {config.move_threshold:.4f}",
+             tracker.last_move <= config.move_threshold),
+        ]
     cooldown_left = (
         max(0.0, config.notification_cooldown_seconds - (timestamp - tracker.stopped_at))
         if tracker.stopped_at is not None and not tracker.active
         else 0.0
     )
-    # 每行：文字 + 是否"这一项挡住了触发"（挡住的画红色）
-    lines = [
-        (f"pet {len(detected)} [{', '.join(detected[:3]) or 'none'}]", not detected),
-        # 非宠物类只是参考：它们能被认出来，说明模型在工作，只是不认得你的猫。
-        (f"other [{', '.join(others[:3]) or 'none'}]", False),
-        (f"conf>={config.detection_confidence:.2f} passed {passed}", passed == 0),
-        (f"move {tracker.last_move:.4f} / {config.move_threshold:.4f}", tracker.last_move <= config.move_threshold),
-        (f"state {'RECORDING' if tracker.active else 'IDLE'}", False),
+    # ACTIVE 表示事件进行中；高清录制本身始终运行，并非触发后才开始。
+    lines += [
+        (f"state {'ACTIVE' if tracker.active else 'IDLE'}", False),
         (f"cooldown {cooldown_left:.0f}s", cooldown_left > 0),
+        ("delivery SAVE ONLY (--dry-run)" if dry_run else "delivery TELEGRAM ON (after event ends)",
+         dry_run),
     ]
     log.debug(" | ".join(text for text, _ in lines))
 
@@ -281,7 +361,7 @@ def _show_debug_window(
     if not _gui_available:
         return True
 
-    canvas = result.plot()  # ultralytics 自带画框，别自己写
+    canvas = motion.overlay(frame) if motion else result.plot()
     for index, (text, blocking) in enumerate(lines):
         cv2.putText(
             canvas, text, (10, 24 + index * 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
@@ -312,7 +392,10 @@ def send_to_telegram(config: Config, clip_path: Path) -> None:
     with clip_path.open("rb") as video:
         response = requests.post(
             f"https://api.telegram.org/bot{config.telegram_bot_token}/sendVideo",
-            data={"chat_id": config.telegram_chat_id, "caption": f"宠物活动 {clip_path.stem}"},
+            data={
+                "chat_id": config.telegram_chat_id,
+                "caption": f"{'画面运动（未确认宠物）' if config.trigger_mode == 'motion' else '宠物活动'} {clip_path.stem}",
+            },
             files={"video": (clip_path.name, video, "video/mp4")},
             timeout=120,
         )

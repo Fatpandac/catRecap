@@ -65,6 +65,19 @@ class ActivityTrackerTest(unittest.TestCase):
         self.assertFalse(t.active)
         self.assertEqual(t.update(66.2, moved(0.2)), "start")
 
+    def test_explicit_moving_flag_bypasses_centroid_logic(self):
+        """帧差触发时直接告知在不在动，不看检测框。"""
+        t = tracker()
+        self.assertEqual(t.update(0.0, [], moving=True), "start")
+        self.assertIsNone(t.update(3.0, [], moving=True))
+        self.assertEqual(t.update(8.1, [], moving=False), "stop")
+
+    def test_explicit_moving_false_ignores_big_centroid_jump(self):
+        t = tracker()
+        t.update(0.0, CENTER, moving=False)
+        self.assertIsNone(t.update(1.0, moved(0.5), moving=False))
+        self.assertFalse(t.active)
+
     def test_exposes_last_move_for_debugging(self):
         t = tracker()
         t.update(0.0, CENTER)
