@@ -2,6 +2,7 @@
 
 import logging
 import os
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -22,6 +23,7 @@ RECONNECT_DELAY = 5.0
 HEARTBEAT_SECONDS = 300.0  # 心跳日志间隔：树莓派上判断是否跟得上实时
 PRUNE_INTERVAL = 20.0  # 清理旧分段的节流间隔
 SEGMENT_FLUSH_DELAY = 2.0  # 等 ffmpeg 把事件末尾的数据写进分段再剪
+RECORDING_STALL_SECONDS = 30.0  # 不能只检查 PID：进程活着但停写也必须恢复
 DEBUG_CONFIDENCE = 0.1  # debug 模式用更低的阈值跑，把被 conf 过滤掉的猫也显示出来
 _gui_available = True  # headless 环境下置为 False，不要每帧都去试窗口
 
@@ -202,6 +204,8 @@ class _Recording:
         self._start()
 
     def _start(self) -> None:
+        self._last_write = None
+        self._progress_at = time.monotonic()
         self.process = recorder.start_recording(
             self.url, self.config.segment_dir, self.config.segment_seconds
         )
@@ -215,6 +219,22 @@ class _Recording:
         now = time.monotonic()
         if now - self.pruned_at >= PRUNE_INTERVAL:
             self.pruned_at = now
+            segments = recorder.list_segments(self.config.segment_dir)
+            write = None
+            if segments:
+                path = segments[-1][0]
+                try:
+                    stat = path.stat()
+                    if stat.st_size:
+                        write = (path, stat.st_size, stat.st_mtime_ns)
+                except FileNotFoundError:
+                    pass
+            if write is not None and write != self._last_write:
+                self._last_write, self._progress_at = write, now
+            elif now - self._progress_at >= RECORDING_STALL_SECONDS:
+                log.warning("高清录像已 %.0f 秒没有写入，重启录制", now - self._progress_at)
+                self.stop()
+                self._start()
             recorder.prune_segments(
                 self.config.segment_dir,
                 keep_seconds=self.config.segment_keep_minutes * 60,
@@ -226,8 +246,9 @@ class _Recording:
         self.process.terminate()
         try:
             self.process.wait(timeout=10)
-        except Exception:
+        except subprocess.TimeoutExpired:
             self.process.kill()
+            self.process.wait(timeout=10)
 
 
 def _clip_and_send(
@@ -395,6 +416,8 @@ def send_to_telegram(config: Config, clip_path: Path) -> None:
     size = clip_path.stat().st_size
     if size > TELEGRAM_VIDEO_LIMIT:
         raise ValueError(f"{clip_path.name} 有 {size / 1e6:.1f}MB，超过 Telegram 50MB 上限")
+    if recorder.video_duration(clip_path, require_frame=True) < recorder.MIN_CLIP_SECONDS:
+        raise ValueError(f"拒绝发送 {clip_path.name}：缺少至少 1 秒且首帧可解码的视频")
     with clip_path.open("rb") as video:
         response = requests.post(
             f"https://api.telegram.org/bot{config.telegram_bot_token}/sendVideo",
